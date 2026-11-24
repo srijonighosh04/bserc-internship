@@ -52,8 +52,9 @@ print_perf_table(perf);
 write_perf_csv(perf, 'uav_trim_results.csv');
 print_extrema_summary(perf, alpha_deg(1), alpha_deg(end));
 
-% Primary deliverable plot (unchanged 0..12 deg)
+% Primary deliverable plots (summary panel + 8 separate 300-dpi PNGs in figures/)
 plot_results(perf, 'uav_trim_plots.png');
+export_publication_figures(perf, 'figures');
 
 %% 3. SECOND CASE: EXTENDED ALPHA SWEEP (-2:0.5:20 DEG) -------------------
 alpha_ext_deg = -2:0.5:20;
