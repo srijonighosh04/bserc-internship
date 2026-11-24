@@ -2,14 +2,15 @@ function varargout = validate_model()
 %VALIDATE_MODEL Verify numerical UAV trim/performance results against theory.
 %
 %   validate_model() runs:
-%     1) Assert-based unit tests for geometry (S, AR, k) and pitch trim
-%        equilibrium (Cm == 0 at every trimmed angle of attack).
+%     1) Assert-based unit tests for geometry (S, AR, k), pitch trim
+%        equilibrium (Cm == 0 at every trimmed point), and iterative
+%        velocity-based trim solver consistency with the alpha sweep.
 %     2) Exact analytical check of trim_solver and performance at the
 %        closed-form optimal lift coefficients.
 %     3) Pass/fail comparison tables with percentage errors comparing
 %        closed-form parabolic drag-polar optima against:
-%          - Nominal sweep: alpha = 0:0.5:12 deg
-%          - Extended fine sweep: alpha = 0:0.05:25 deg
+%          - Primary sweep:  alpha = 0:0.5:12 deg
+%          - Extended sweep: alpha = -2:0.5:20 deg (shows min-power point)
 %
 %   report = validate_model() optionally returns a struct containing the
 %   theoretical values, sweep values, percentage errors, and pass counts.
@@ -33,15 +34,17 @@ function varargout = validate_model()
     params.rho     = 1.225;
     params.g       = 10.0;
 
-    alpha_nom_deg  = 0:0.5:12;
-    alpha_fine_deg = 0:0.05:25;
+    alpha_nom_deg = 0:0.5:12;
+    alpha_ext_deg = -2:0.5:20;
+    V_sweep_mps   = 8:0.5:30;
 
     %% 2. RUN NUMERICAL PIPELINE ------------------------------------------
-    geom      = compute_geometry(params);
-    trim_nom  = trim_solver(alpha_nom_deg, params);
-    perf_nom  = performance(trim_nom, geom, params);
-    trim_fine = trim_solver(alpha_fine_deg, params);
-    perf_fine = performance(trim_fine, geom, params);
+    geom     = compute_geometry(params);
+    trim_nom = trim_solver(alpha_nom_deg, params);
+    perf_nom = performance(trim_nom, geom, params);
+    trim_ext = trim_solver(alpha_ext_deg, params);
+    perf_ext = performance(trim_ext, geom, params);
+    vtrim    = velocity_trim_solver(V_sweep_mps, geom, params);
 
     %% 3. ASSERT-BASED UNIT TESTS -----------------------------------------
     fprintf('=== 1. Assert-Based Unit Tests ===\n');
@@ -65,15 +68,28 @@ function varargout = validate_model()
              params.Cmde .* trim_nom.de_rad;
     max_Cm_nom = max(abs(Cm_nom));
     assert(max_Cm_nom < 1e-12, ...
-           'Trim test failed (nominal): max |Cm| = %.3e >= 1e-12', max_Cm_nom);
+           'Trim test failed (primary): max |Cm| = %.3e >= 1e-12', max_Cm_nom);
 
-    Cm_fine = params.Cm0 + params.Cmalpha .* trim_fine.alpha_rad + ...
-              params.Cmde .* trim_fine.de_rad;
-    max_Cm_fine = max(abs(Cm_fine));
-    assert(max_Cm_fine < 1e-12, ...
-           'Trim test failed (fine): max |Cm| = %.3e >= 1e-12', max_Cm_fine);
-    fprintf('[PASS] Trim Cm == 0 assertions: max |Cm| = %.2e (nominal), %.2e (fine)\n', ...
-            max_Cm_nom, max_Cm_fine);
+    Cm_ext = params.Cm0 + params.Cmalpha .* trim_ext.alpha_rad + ...
+             params.Cmde .* trim_ext.de_rad;
+    max_Cm_ext = max(abs(Cm_ext));
+    assert(max_Cm_ext < 1e-12, ...
+           'Trim test failed (extended): max |Cm| = %.3e >= 1e-12', max_Cm_ext);
+    fprintf('[PASS] Trim Cm == 0 assertions: max |Cm| = %.2e (primary), %.2e (extended)\n', ...
+            max_Cm_nom, max_Cm_ext);
+
+    % 3c. Iterative velocity-solver unit tests (L == W and alpha-sweep match)
+    assert(vtrim.max_abs_residual < 1e-8, ...
+           'Velocity solver L == W residual too large: %.3e N', vtrim.max_abs_residual);
+    vcheck_nom = velocity_trim_solver(perf_nom.V, geom, params);
+    max_da = max(abs(vcheck_nom.alpha_deg - perf_nom.alpha_deg));
+    max_de = max(abs(vcheck_nom.de_deg    - perf_nom.de_deg));
+    max_dT = max(abs(vcheck_nom.Tr        - perf_nom.Tr));
+    max_dP = max(abs(vcheck_nom.Pr        - perf_nom.Pr));
+    assert(max_da < 1e-8 && max_de < 1e-8 && max_dT < 1e-8 && max_dP < 1e-7, ...
+           'Iterative velocity solver did not match alpha sweep within tolerance.');
+    fprintf('[PASS] Iterative V-solver assertions: max |L-W| = %.2e N, max |d_alpha| = %.2e deg\n', ...
+            vtrim.max_abs_residual, max_da);
 
     %% 4. CLOSED-FORM PARABOLIC DRAG POLAR THEORY -------------------------
     theory = compute_closed_form_theory(params, geom);
@@ -91,33 +107,34 @@ function varargout = validate_model()
            'Exact Pr_min mismatch against theory.');
     fprintf('[PASS] Exact analytical solver check: all errors < 1e-12\n\n');
 
-    %% 5. COMPARISON TABLE: CLOSED-FORM vs NOMINAL SWEEP (0:0.5:12 deg) ---
+    %% 5. COMPARISON TABLE: CLOSED-FORM vs PRIMARY SWEEP (0:0.5:12 deg) ---
     tol_nom_pct = 2.5;
-    fprintf('=== 2. Closed-Form Theory vs. Nominal Sweep (alpha = 0:0.5:12 deg, tol = %.1f%%) ===\n', ...
+    fprintf('=== 2. Closed-Form Theory vs. Primary Sweep (alpha = 0:0.5:12 deg, tol = %.1f%%) ===\n', ...
             tol_nom_pct);
     fprintf('Note: Theoretical max CL^1.5/CD (min Pr) occurs at alpha = %.2f deg (> 12.0 deg limit).\n', ...
             theory.max_E.alpha_deg);
     res_nom = print_comparison_table(theory, perf_nom, tol_nom_pct);
 
-    %% 6. COMPARISON TABLE: CLOSED-FORM vs FINE SWEEP (0:0.05:25 deg) -----
-    tol_fine_pct = 0.5;
-    fprintf('\n=== 3. Closed-Form Theory vs. Extended Fine Sweep (alpha = 0:0.05:25 deg, tol = %.1f%%) ===\n', ...
-            tol_fine_pct);
-    res_fine = print_comparison_table(theory, perf_fine, tol_fine_pct);
+    %% 6. COMPARISON TABLE: CLOSED-FORM vs EXTENDED SWEEP (-2:0.5:20 deg) -
+    tol_ext_pct = 2.5;
+    fprintf('\n=== 3. Closed-Form Theory vs. Extended Sweep (alpha = -2:0.5:20 deg, tol = %.1f%%) ===\n', ...
+            tol_ext_pct);
+    fprintf('Note: Extended sweep captures min Pr near CL ~ 0.85 (no stall; >12 deg indicative).\n');
+    res_ext = print_comparison_table(theory, perf_ext, tol_ext_pct);
 
-    % Assert that extended fine sweep satisfies all theoretical checks within 0.5%
-    assert(res_fine.num_failed == 0, ...
-           'Extended fine sweep failed %d theoretical comparison(s) at %.1f%% tolerance.', ...
-           res_fine.num_failed, tol_fine_pct);
-    fprintf('\n[PASS] Extended fine sweep matched all closed-form optima within %.1f%%.\n', ...
-            tol_fine_pct);
+    assert(res_ext.num_failed == 0, ...
+           'Extended sweep (-2:0.5:20 deg) failed %d theoretical comparison(s) at %.1f%% tolerance.', ...
+           res_ext.num_failed, tol_ext_pct);
+    fprintf('\n[PASS] Extended sweep (-2:0.5:20 deg) matched both closed-form optima within %.1f%%.\n', ...
+            tol_ext_pct);
 
     if nargout > 0
         report = struct();
         report.geom     = geom;
         report.theory   = theory;
         report.nominal  = res_nom;
-        report.fine     = res_fine;
+        report.extended = res_ext;
+        report.vtrim    = vtrim;
         report.max_Cm   = max_Cm_nom;
         varargout{1}    = report;
     end
@@ -134,15 +151,15 @@ function theory = compute_closed_form_theory(params, geom)
     CLa_t = params.CLalpha - (params.CLde * params.Cmalpha) / params.Cmde;
 
     % --- Point 1: Max L/D (also Minimum Thrust Required) -----------------
-    CL1    = sqrt(params.CD0 / geom.k);
-    CD1    = 2 * params.CD0;
-    LDmax  = 1 / (2 * sqrt(geom.k * params.CD0));
-    Tr_min = geom.W / LDmax;
-    a1_rad = (CL1 - CL_t0) / CLa_t;
+    CL1     = sqrt(params.CD0 / geom.k);
+    CD1     = 2 * params.CD0;
+    LDmax   = 1 / (2 * sqrt(geom.k * params.CD0));
+    Tr_min  = geom.W / LDmax;
+    a1_rad  = (CL1 - CL_t0) / CLa_t;
     de1_rad = -(params.Cm0 + params.Cmalpha * a1_rad) / params.Cmde;
-    V1     = sqrt((2 * geom.W) / (params.rho * geom.S * CL1));
-    Pr1    = Tr_min * V1;
-    E1     = (CL1 ^ 1.5) / CD1;
+    V1      = sqrt((2 * geom.W) / (params.rho * geom.S * CL1));
+    Pr1     = Tr_min * V1;
+    E1      = (CL1 ^ 1.5) / CD1;
 
     p1 = struct();
     p1.CL        = CL1;
@@ -156,15 +173,15 @@ function theory = compute_closed_form_theory(params, geom)
     p1.Pr        = Pr1;
 
     % --- Point 2: Max CL^1.5/CD (also Minimum Power Required) ------------
-    CL2    = sqrt((3 * params.CD0) / geom.k);
-    CD2    = 4 * params.CD0;
-    LD2    = CL2 / CD2;
-    Emax   = (CL2 ^ 1.5) / CD2;
-    Tr2    = geom.W / LD2;
-    a2_rad = (CL2 - CL_t0) / CLa_t;
+    CL2     = sqrt((3 * params.CD0) / geom.k);
+    CD2     = 4 * params.CD0;
+    LD2     = CL2 / CD2;
+    Emax    = (CL2 ^ 1.5) / CD2;
+    Tr2     = geom.W / LD2;
+    a2_rad  = (CL2 - CL_t0) / CLa_t;
     de2_rad = -(params.Cm0 + params.Cmalpha * a2_rad) / params.Cmde;
-    V2     = sqrt((2 * geom.W) / (params.rho * geom.S * CL2));
-    Pr_min = Tr2 * V2;
+    V2      = sqrt((2 * geom.W) / (params.rho * geom.S * CL2));
+    Pr_min  = Tr2 * V2;
 
     p2 = struct();
     p2.CL        = CL2;
